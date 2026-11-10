@@ -1,0 +1,36 @@
+{
+  "conda_env": "tools/activate.sh",
+  "motion_dir": "data/lafan1_g1",
+  "robot_description_dir": "data/g1_description",
+  "robot_usd_dir": "data/g1_usd",
+  "ground_dir": "data/ground",
+  "logs_dir": "logs",         // 训练输出根目录：checkpoint、配置及日志保存到 <logs_dir>/<run_name>/
+
+  "training": {
+    "num_envs": 4096,          // 默认 4096：并行仿真环境数
+    "iterations": 320000,      // 默认 320000：训练总迭代数（续训也是总数）
+    "buffer_steps": 1000,      // 默认 1000：每个环境的回放缓存步数
+    "utd": 0.4,                // 默认 0.4：每个向量化仿真步对应的更新次数
+    "horizon": 32,             // 默认 32：策略想象轨迹长度
+    "goal_frames": 10,         // 默认 10：未来参考帧数
+    "hist": 10,                // 默认 10：观测历史帧数
+    "wm_window": 8,            // 默认 8：世界模型训练窗口步数
+    "wm_batches": 10,          // 默认 10：每次迭代的世界模型更新次数
+    "wm_batch": 2048,          // 默认 2048：世界模型批量大小
+    "pi_batch": 4096,          // 默认 4096：策略想象轨迹批量大小
+    "lr": 0.0002,              // 默认 0.0002：初始学习率
+    "gamma": 0.99,             // 默认 0.99：折扣因子
+    "lam": 0.95,               // 默认 0.95：GAE λ
+    "action_noise": 0.1,       // 默认 0.1：采样时动作噪声标准差
+    "critic_epochs": 5,        // 默认 5：价值网络更新轮数
+    "critic_minibatches": 4,   // 默认 4：每轮价值网络 minibatch 数
+    "no_critic": false,        // 默认 false：是否禁用价值网络
+    "warmup_steps": 64,        // 默认 64：训练前的仿真采样步数
+    "wm_only_iters": 500,      // 默认 500：开头仅训练世界模型的迭代数
+    "lr_decay_iters": 250000,  // 默认 250000：余弦学习率衰减迭代数
+    "ckpt_every": 2000,        // 默认 2000：保存检查点的间隔
+    "log_every": 50,           // 默认 50：记录训练指标的间隔
+    "seed": 0,                 // 默认 0：随机种子
+    "amp": "bf16"              // 默认 "bf16"：可选 "bf16" 或 "none"
+  }
+}

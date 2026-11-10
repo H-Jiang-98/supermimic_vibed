@@ -23,7 +23,7 @@ from isaaclab.utils import configclass, instantiate, replace
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
 from .reset_sampling import update_bin_returns
-from .robot import DATA_DIR, G1_CFG, G1_JOINT_NAMES, action_scale
+from .robot import GROUND_PATH, G1_CFG, G1_JOINT_NAMES, action_scale
 from .rotations import mat_to_quat, quat_to_mat, so3_exp
 
 
@@ -32,7 +32,7 @@ class TrackingSceneCfg(InteractiveSceneCfg):
     # Use the official asset cached by download_data.sh, avoiding OmniClient's S3 download at startup.
     ground = AssetBaseCfg(
         prim_path="/World/ground",
-        spawn=sim_utils.GroundPlaneCfg(usd_path=f"{DATA_DIR}/ground/default_ground_plane.usda"),
+        spawn=sim_utils.GroundPlaneCfg(usd_path=GROUND_PATH),
     )
     robot = replace(G1_CFG, prim_path="{ENV_REGEX_NS}/Robot")
 
@@ -185,7 +185,7 @@ class TrackingSim:
 
     def refresh(self):
         """Propagate written states so that ``state()`` is consistent after a reset."""
-        self.sim.forward() if hasattr(self.sim, "forward") else None
+        self.sim.forward()
         self.scene.update(0.0)
 
     # ------------------------------------------------------------------ step

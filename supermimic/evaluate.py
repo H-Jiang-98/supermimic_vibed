@@ -18,17 +18,26 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+from supermimic.config import configure_cli
+from supermimic.checkpoints import pending_checkpoints, checkpoint_iteration
+
+runtime_config = configure_cli()
+
 from isaaclab.app import add_launcher_args, launch_simulation
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--run_dir", type=str, required=True)
+parser = argparse.ArgumentParser(allow_abbrev=False)
+parser.add_argument("--config", default=runtime_config["config_file"], help="Runtime JSON configuration")
+parser.add_argument("--run_dir", type=str, default=os.path.join(runtime_config["logs_dir"], "run"))
 parser.add_argument("--watch", action="store_true")
 parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpoint")
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
-parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
+parser.add_argument("--motion_dir", type=str, default=runtime_config["motion_dir"])
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
 add_launcher_args(parser)
 args = parser.parse_args()
+if args.every < 1:
+    parser.error("--every must be >= 1")
+args.runtime_config = runtime_config
 
 import numpy as np
 import torch
@@ -53,7 +62,7 @@ C = len(motion.names)
 def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     a_ = ck["args"]
     K, Hh = a_["goal_frames"], a_["hist"]
-    networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
+    networks.AMP_DTYPE = torch.bfloat16 if a_["amp"] == "bf16" else None
     pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
@@ -112,10 +121,9 @@ with launch_simulation(sim_cfg, args):
         open(out_csv, "w").write("iteration,train_wall_h,saved_at,eval_at,norm_return,norm_return_framew,n_failed,failed\n")
     while True:
         ckpts = sorted(glob.glob(os.path.join(args.run_dir, "ckpt_*.pt")))
-        todo = [c for c in ckpts if int(os.path.basename(c)[5:11]) not in done]
-        todo = [c for c in todo if (int(os.path.basename(c)[5:11]) // 2000) % args.every == 0]
+        todo = pending_checkpoints(ckpts, done, args.every)
         for c in todo:
-            it = int(os.path.basename(c)[5:11])
+            it = checkpoint_iteration(c)
             ck = torch.load(c, map_location=dev)
             t0 = time.time()
             res = evaluate(env, ck)

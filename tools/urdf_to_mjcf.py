@@ -6,7 +6,10 @@ import sys
 
 import mujoco
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "g1_description")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from supermimic.config import load_config
+
+ROOT = load_config()["robot_description_dir"]
 src = os.path.join(ROOT, "g1_29dof_rev_1_0.urdf")
 tmp = os.path.join(ROOT, "_g1_mj.urdf")
 out = os.path.join(ROOT, "g1_29dof.xml")

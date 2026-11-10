@@ -8,23 +8,24 @@ import argparse
 import os
 import re
 import subprocess
+import sys
 
 os.environ.setdefault("MUJOCO_GL", "egl")
-# use the NVIDIA EGL vendor (GPU) rather than Mesa's CPU rasterizer when the image does not register it
-_NV_EGL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docker", "10_nvidia.json")
-if os.path.exists(_NV_EGL):
-    os.environ.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", os.path.abspath(_NV_EGL))
 import mujoco
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-MJCF = os.path.join(ROOT, "data", "g1_description", "g1_29dof.xml")
+sys.path.insert(0, ROOT)
+from supermimic.config import load_config
+
+ROBOT_DIR = load_config()["robot_description_dir"]
+MJCF = os.path.join(ROBOT_DIR, "g1_29dof.xml")
 
 
 def two_robot_xml() -> str:
     xml = open(MJCF).read()
-    xml = re.sub(r'meshdir="[^"]*"', 'meshdir="' + os.path.join(ROOT, 'data', 'g1_description') + '/"', xml)
+    xml = re.sub(r'meshdir="[^"]*"', 'meshdir="' + ROBOT_DIR + '/"', xml)
     body = xml[xml.index('<body name="pelvis"') : xml.index("</worldbody>")]
     ghost = re.sub(r' name="([^"]+)"', r' name="ref_\1"', body)
     ghost = re.sub(r'rgba="[^"]*"', 'rgba="0.35 0.65 1.0 0.25"', ghost)
@@ -70,7 +71,7 @@ def main():
     renderer = mujoco.Renderer(model, a.height, a.width)
     cam = mujoco.MjvCamera()
     cam.distance, cam.azimuth, cam.elevation = 3.6, 135.0, -12.0
-    font = ImageFont.load_default(size=22) if hasattr(ImageFont, "load_default") else None
+    font = ImageFont.load_default(size=22)
     clips = a.clips or names
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{a.width}x{a.height}", "-r", str(a.fps),

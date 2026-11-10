@@ -13,11 +13,14 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-URDF_PATH = os.path.join(DATA_DIR, "g1_description", "g1_29dof_rev_1_0.urdf")
-MJCF_PATH = os.path.join(DATA_DIR, "g1_description", "g1_29dof.xml")
-USD_DIR = os.path.join(DATA_DIR, "g1_usd")
+from .config import load_config
+
+_settings = load_config()
+URDF_PATH = os.path.join(_settings["robot_description_dir"], "g1_29dof_rev_1_0.urdf")
+MJCF_PATH = os.path.join(_settings["robot_description_dir"], "g1_29dof.xml")
+USD_DIR = _settings["robot_usd_dir"]
 USD_PATH = os.path.join(USD_DIR, "g1_29dof", "g1_29dof.usda")
+GROUND_PATH = os.path.join(_settings["ground_dir"], "default_ground_plane.usda")
 
 ARMATURE_5020 = 0.003609725
 ARMATURE_7520_14 = 0.010177520

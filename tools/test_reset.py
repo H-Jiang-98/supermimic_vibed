@@ -8,9 +8,10 @@ from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
 from supermimic.mdp import MDP
 from supermimic.motion import MotionLib
+from supermimic.config import load_config
 from supermimic.robot import default_joint_pos_list
 dev = "cuda:0"
-kin = G1Kinematics(dev); motion = MotionLib.from_dir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "lafan1_g1"), kin, dev)
+kin = G1Kinematics(dev); motion = MotionLib.from_dir(load_config()["motion_dir"], kin, dev)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
 sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):

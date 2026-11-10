@@ -12,39 +12,26 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
+from supermimic.config import configure_cli
+from supermimic.training_config import TRAIN_DEFAULTS, add_training_args, validate_training
+
+runtime_config = configure_cli()
+
 from isaaclab.app import add_launcher_args, launch_simulation
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--num_envs", type=int, default=4096)
-parser.add_argument("--iterations", type=int, default=320_000)
-parser.add_argument("--buffer_steps", type=int, default=1000)
-parser.add_argument("--utd", type=float, default=0.4, help="updates per vectorized simulator step")
-parser.add_argument("--horizon", type=int, default=32)
-parser.add_argument("--goal_frames", type=int, default=10)
-parser.add_argument("--hist", type=int, default=10)
-parser.add_argument("--wm_window", type=int, default=8)
-parser.add_argument("--wm_batches", type=int, default=10)
-parser.add_argument("--wm_batch", type=int, default=2048)
-parser.add_argument("--pi_batch", type=int, default=4096)
-parser.add_argument("--lr", type=float, default=2e-4)
-parser.add_argument("--gamma", type=float, default=0.99)
-parser.add_argument("--lam", type=float, default=0.95)
-parser.add_argument("--action_noise", type=float, default=0.1)
-parser.add_argument("--critic_epochs", type=int, default=5)
-parser.add_argument("--critic_minibatches", type=int, default=4)
-parser.add_argument("--no_critic", action="store_true")
-parser.add_argument("--warmup_steps", type=int, default=64, help="sim steps before any update")
-parser.add_argument("--wm_only_iters", type=int, default=500, help="world-model-only iterations at the start")
-parser.add_argument("--lr_decay_iters", type=int, default=250_000)
-parser.add_argument("--ckpt_every", type=int, default=2000)
-parser.add_argument("--log_every", type=int, default=50)
-parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
-parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
-parser.add_argument("--seed", type=int, default=0)
+parser = argparse.ArgumentParser(allow_abbrev=False)
+parser.add_argument("--config", default=runtime_config["config_file"], help="Runtime JSON configuration")
+add_training_args(parser, runtime_config["training"])
+parser.add_argument("--motion_dir", type=str, default=runtime_config["motion_dir"])
+parser.add_argument("--log_dir", type=str, default=os.path.join(runtime_config["logs_dir"], "run"))
 parser.add_argument("--resume", type=str, default=None)
-parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 add_launcher_args(parser)
 args = parser.parse_args()
+try:
+    effective_training = validate_training({key: getattr(args, key) for key in TRAIN_DEFAULTS})
+except ValueError as error:
+    parser.error(str(error))
+args.runtime_config = dict(runtime_config, training=effective_training, motion_dir=os.path.abspath(args.motion_dir))
 
 import torch
 import torch.nn as nn

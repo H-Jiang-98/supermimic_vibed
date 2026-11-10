@@ -4,13 +4,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import torch
 from supermimic.kinematics import G1Kinematics
 from supermimic.motion import MotionLib
+from supermimic.config import load_config
 from supermimic.mdp import MDP, flatten_state, unflatten_state, normalize_xi, OBS_DIM
 from supermimic.networks import WorldModel
 from supermimic.robot import default_joint_pos_list
 torch.backends.cuda.matmul.allow_tf32 = True
 dev = "cuda:0"
 kin = G1Kinematics(dev)
-motion = MotionLib.from_dir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "lafan1_g1"), kin, dev)
+motion = MotionLib.from_dir(load_config()["motion_dir"], kin, dev)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
 wm = WorldModel().to(dev)
 B = 2048
