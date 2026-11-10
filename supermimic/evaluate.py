@@ -19,7 +19,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 from supermimic.config import configure_cli
-from supermimic.checkpoints import pending_checkpoints, checkpoint_iteration
+from supermimic.checkpoints import pending_checkpoints, checkpoint_iteration, checkpoint_obs_mode
 
 runtime_config = configure_cli()
 
@@ -45,7 +45,7 @@ import torch
 import supermimic.networks as networks
 from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import MAX_STEP_REWARD, OBS_DIM, MDP
+from supermimic.mdp import MAX_STEP_REWARD, MDP
 from supermimic.motion import MotionLib
 from supermimic.networks import Policy
 from supermimic.robot import default_joint_pos_list
@@ -60,10 +60,13 @@ C = len(motion.names)
 
 @torch.no_grad()
 def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
+    mode = checkpoint_obs_mode(ck)
+    mdp = MDP(kin, motion, env.default_q, obs_mode=mode)
+    env.mdp = mdp
     a_ = ck["args"]
     K, Hh = a_["goal_frames"], a_["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if a_["amp"] == "bf16" else None
-    pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
+    pi = Policy(mdp.obs_dim, 73 * K, hist=Hh).to(dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
     ids = torch.arange(C, device=dev)

@@ -36,10 +36,11 @@ args.runtime_config = dict(runtime_config, training=effective_training, motion_d
 import torch
 import torch.nn as nn
 
+from supermimic.checkpoints import checkpoint_obs_mode
 from supermimic.buffer import ReplayBuffer
 from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
+from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MDP, invariant_features, normalize_xi, unflatten_state
 from supermimic.motion import MotionLib
 import supermimic.networks as networks
 from supermimic.networks import Critic, Policy, WorldModel
@@ -50,28 +51,33 @@ torch.backends.cudnn.allow_tf32 = True
 torch.manual_seed(args.seed)
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
 dev = "cuda:0"
+resume_ck = None
+if args.resume:
+    resume_ck = torch.load(args.resume, map_location="cpu")
+    checkpoint_obs_mode(resume_ck, args.obs_mode)
 os.makedirs(args.log_dir, exist_ok=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
 kin = G1Kinematics(dev)
 motion = MotionLib.from_dir(args.motion_dir, kin, dev)
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev), obs_mode=args.obs_mode)
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = 73 * K
 CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
 
 wm = WorldModel().to(dev)
-pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh).to(dev)
+pi = Policy(mdp.obs_dim, GOAL_DIM, hist=Hh).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
 opt_wm = torch.optim.Adam(wm.parameters(), lr=args.lr)
 opt_pi = torch.optim.Adam(pi.parameters(), lr=args.lr, betas=(0.9, 0.95))
 opt_v = torch.optim.Adam(critic.parameters(), lr=args.lr)
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 if args.resume:
-    ck = torch.load(args.resume, map_location=dev)
+    ck = resume_ck
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
+    del ck, resume_ck
 
 
 # State-error scale floors; out_norm tracks pose residuals and velocity/joint increments.
@@ -248,7 +254,7 @@ sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
     env = TrackingSim(sim_cfg, args.num_envs, motion, mdp, gamma=args.gamma)
     buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
-    obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
+    obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
 
     @torch.no_grad()
     def collect(n_steps: int, stats: dict):

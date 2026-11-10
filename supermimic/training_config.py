@@ -3,7 +3,10 @@
 import argparse
 import math
 
+OBS_DIMS = {"paper": 93, "so3": 96, "se3": 99, "se23": 102}
+
 TRAIN_DEFAULTS = {
+    "obs_mode": "paper",
     "num_envs": 4096,
     "iterations": 320_000,
     "buffer_steps": 1000,
@@ -59,6 +62,8 @@ def validate_training(overrides):
         raise ValueError("training.lam must be in [0, 1]")
     if values["action_noise"] < 0:
         raise ValueError("training.action_noise must be nonnegative")
+    if values["obs_mode"] not in OBS_DIMS:
+        raise ValueError(f"training.obs_mode must be one of {tuple(OBS_DIMS)}")
     if values["amp"] not in ("none", "bf16"):
         raise ValueError("training.amp must be 'none' or 'bf16'")
     if values["buffer_steps"] < values["wm_window"]:
@@ -77,6 +82,8 @@ def add_training_args(parser: argparse.ArgumentParser, overrides=None):
             group.add_argument("--use_critic", dest="no_critic", action="store_false", help="Override no_critic=true")
         else:
             options = {"type": type(default), "help": f"Code default: {default}"}
+            if key == "obs_mode":
+                options["choices"] = tuple(OBS_DIMS)
             if key == "amp":
                 options["choices"] = ("none", "bf16")
             parser.add_argument(f"--{key}", **options)

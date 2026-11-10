@@ -28,7 +28,8 @@ kin = G1Kinematics(dev)
 t0 = time.time()
 motion = MotionLib.from_dir(load_config()["motion_dir"], kin, dev)
 print(f"motion: {len(motion.names)} clips, {motion.num_frames} frames ({motion.num_frames * 0.02 / 3600:.2f} h), bins {motion.num_bins}, load {time.time() - t0:.1f}s")
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev),
+          obs_mode=load_config()["training"]["obs_mode"])
 sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
     env = TrackingSim(sim_cfg, args.num_envs, motion, mdp, eval_mode=True)

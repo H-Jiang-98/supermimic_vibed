@@ -13,25 +13,21 @@ import torch
 from .dimensions import STATE_DIM, XI_DIM
 from .kinematics import G1Kinematics
 from .motion import CONTROL_DT, MotionLib
-from .rotations import mat_to_6d, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat
+from .rotations import mat_to_6d, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat, so3_log, se3_log, se23_log
+from .training_config import OBS_DIMS
 
-OBS_DIM = 29 + 29 + 3 + 3 + 29 + 6
+BASE_OBS_DIM = 93
 NUM_J = 29
 
-# Table A.1 sensor noise (uniform half-widths), plus the reference-relative orientation
-OBS_NOISE = torch.cat(
+# Table A.1 sensor noise (uniform half-widths). Reference errors have no noise.
+BASE_OBS_NOISE = torch.cat(
     (
         torch.full((29,), 0.01),
         torch.full((29,), 0.5),
         torch.full((3,), 0.2),
         torch.full((3,), 0.05),
         torch.zeros(29),
-        torch.full((6,), 0.05),
     )
-)
-# normalization of the obs before the policy (qd and angular velocity are large)
-OBS_SCALE = torch.cat(
-    (torch.ones(29), torch.full((29,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(29), torch.ones(6))
 )
 MAX_STEP_REWARD = (4 * 1.0 + 2 * 0.5) * CONTROL_DT
 
@@ -81,24 +77,41 @@ INV_DIM = 1 + 3 + 3 + 3 + 29 + 29
 
 
 class MDP:
-    def __init__(self, kin: G1Kinematics, motion: MotionLib, default_q: torch.Tensor, cfg: RewardCfg = RewardCfg()):
+    def __init__(self, kin: G1Kinematics, motion: MotionLib, default_q: torch.Tensor, cfg: RewardCfg = RewardCfg(),
+                 *, obs_mode: str = "paper"):
+        if obs_mode not in OBS_DIMS:
+            raise ValueError(f"Unknown observation mode: {obs_mode!r}")
+        self.obs_mode = obs_mode
+        self.obs_dim = OBS_DIMS[obs_mode]
         self.kin, self.motion, self.cfg = kin, motion, cfg
         self.default_q = default_q
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
         self.soft_lo, self.soft_hi = mid - half * cfg.soft_limit_factor, mid + half * cfg.soft_limit_factor
         dev = default_q.device
-        self.obs_noise = OBS_NOISE.to(dev)
-        self.obs_scale = OBS_SCALE.to(dev)
+        extra = self.obs_dim - BASE_OBS_DIM
+        self.obs_noise = torch.cat((BASE_OBS_NOISE, torch.zeros(extra))).to(dev)
 
     # ---------------- observation ----------------
     def obs(self, S, a_prev, xi, f) -> torch.Tensor:
-        """Noise-free proprioceptive observation (+ reference-relative root orientation)."""
+        """Proprioception plus configured body-frame reference error at frame f."""
         p, R, v, w, q, qd = S
         Rt = R.transpose(-1, -2)
         dq0 = xi[..., 1:30]
         g_b = -R[..., 2, :]  # R^T (0,0,-1)
-        rel = mat_to_6d(Rt @ self.motion.root_R[f])
-        return torch.cat((q - self.default_q - dq0, qd, (Rt @ w.unsqueeze(-1)).squeeze(-1), g_b, a_prev, rel), -1)
+        base = torch.cat((q - self.default_q - dq0, qd, (Rt @ w.unsqueeze(-1)).squeeze(-1), g_b, a_prev), -1)
+        if self.obs_mode == "paper":
+            return base
+        dR = Rt @ self.motion.root_R[f]
+        if self.obs_mode == "so3":
+            error = so3_log(dR)
+        else:
+            dp = (Rt @ (self.motion.root_p[f] - p).unsqueeze(-1)).squeeze(-1)
+            if self.obs_mode == "se3":
+                error = se3_log(dR, dp)
+            else:
+                dv = (Rt @ (self.motion.root_v[f] - v).unsqueeze(-1)).squeeze(-1)
+                error = se23_log(dR, dp, dv)
+        return torch.cat((base, error), -1)
 
     def add_noise(self, o: torch.Tensor) -> torch.Tensor:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise

@@ -122,3 +122,35 @@ def quat_slerp(q0: torch.Tensor, q1: torch.Tensor, t: torch.Tensor) -> torch.Ten
     w0 = torch.where(s < 1e-6, 1 - t, torch.sin((1 - t) * theta) / (s + 1e-12))
     w1 = torch.where(s < 1e-6, t, torch.sin(t * theta) / (s + 1e-12))
     return F.normalize(w0 * q0 + w1 * q1, dim=-1)
+
+
+def so3_left_jacobian_inverse(phi: torch.Tensor) -> torch.Tensor:
+    """Inverse left Jacobian, with a small-angle series and stable half-angle form."""
+    theta2 = phi.square().sum(-1)
+    # Keep the inactive branch finite too, for autograd at zero.
+    safe2 = theta2.clamp_min(1e-6)
+    theta = safe2.sqrt()
+    half = theta * 0.5
+    coefficient = torch.where(
+        theta2 < 1e-4,
+        1 / 12 + theta2 / 720 + theta2.square() / 30240,
+        (1 - half / torch.tan(half)) / safe2,
+    )
+    K = skew(phi)
+    return torch.eye(3, dtype=phi.dtype, device=phi.device) - 0.5 * K + coefficient[..., None, None] * (K @ K)
+
+
+def se3_log(R: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    """SE(3) logarithm as [rotation, position]; p is the group translation."""
+    phi = so3_log(R)
+    rho = (so3_left_jacobian_inverse(phi) @ p.unsqueeze(-1)).squeeze(-1)
+    return torch.cat((phi, rho), -1)
+
+
+def se23_log(R: torch.Tensor, p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """SE₂(3) logarithm as [rotation, position, velocity]."""
+    phi = so3_log(R)
+    Jinv = so3_left_jacobian_inverse(phi)
+    rho = (Jinv @ p.unsqueeze(-1)).squeeze(-1)
+    nu = (Jinv @ v.unsqueeze(-1)).squeeze(-1)
+    return torch.cat((phi, rho, nu), -1)

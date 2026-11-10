@@ -7,6 +7,7 @@
   "logs_dir": "logs",         // 训练输出根目录：checkpoint、配置及日志保存到 <logs_dir>/<run_name>/
 
   "training": {
+    "obs_mode": "paper",      // paper (93), so3 (96), se3 (99), se23 (102)：观测模式
     "num_envs": 4096,          // 默认 4096：并行仿真环境数
     "iterations": 320000,      // 默认 320000：训练总迭代数（续训也是总数）
     "buffer_steps": 1000,      // 默认 1000：每个环境的回放缓存步数

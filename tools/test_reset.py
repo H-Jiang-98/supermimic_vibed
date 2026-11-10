@@ -12,7 +12,8 @@ from supermimic.config import load_config
 from supermimic.robot import default_joint_pos_list
 dev = "cuda:0"
 kin = G1Kinematics(dev); motion = MotionLib.from_dir(load_config()["motion_dir"], kin, dev)
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev),
+          obs_mode=load_config()["training"]["obs_mode"])
 sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
     env = TrackingSim(sim_cfg, 64, motion, mdp, eval_mode=True)
