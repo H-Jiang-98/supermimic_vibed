@@ -20,7 +20,7 @@ S = motion.ref_state(f); S1 = motion.ref_state(f + 1)
 a = torch.randn(B * 8, 29, device=dev); xi = torch.zeros(B * 8, 33, device=dev); xi[:, 0] = 0.75
 wm.in_norm.update(wm.inputs(S, a, normalize_xi(xi))); wm.out_norm.update(wm.targets(S, S1))
 std = wm.out_norm.std()
-names = ["dp"] * 3 + ["dth"] * 3 + ["dv"] * 3 + ["dw"] * 3 + ["dq"] * 29 + ["dqd"] * 29
+names = ["r_p"] * 3 + ["r_theta"] * 3 + ["dv"] * 3 + ["dw"] * 3 + ["dq"] * 29 + ["dqd"] * 29
 print("out std per group:", {n: f"{std[[i for i, m in enumerate(names) if m == n]].min().item():.2e}..{std[[i for i, m in enumerate(names) if m == n]].max().item():.2e}" for n in dict.fromkeys(names)})
 def timeit(fn, n=5):
     fn(); torch.cuda.synchronize(); t = time.time()

@@ -61,14 +61,13 @@ def unflatten_state(x: torch.Tensor):
 
 
 def invariant_features(S) -> torch.Tensor:
-    """Heading- and position-invariant state features: height, tilt (6D), body-frame velocities, joints."""
+    """XY/yaw-invariant features: height, body-frame gravity (m/s²), velocities, and joints."""
     p, R, v, w, q, qd = S
-    H = yaw_mat(R)
     Rt = R.transpose(-1, -2)
     return torch.cat(
         (
             p[..., 2:3],
-            mat_to_6d(H.transpose(-1, -2) @ R),
+            -9.81 * R[..., 2, :],  # R^T (0, 0, -9.81)
             (Rt @ v.unsqueeze(-1)).squeeze(-1),
             (Rt @ w.unsqueeze(-1)).squeeze(-1),
             q,
@@ -78,7 +77,7 @@ def invariant_features(S) -> torch.Tensor:
     )
 
 
-INV_DIM = 1 + 6 + 3 + 3 + 29 + 29
+INV_DIM = 1 + 3 + 3 + 3 + 29 + 29
 
 
 class MDP:

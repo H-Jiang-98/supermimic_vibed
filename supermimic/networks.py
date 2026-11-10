@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 
 from .mdp import INV_DIM, NUM_J, XI_DIM, invariant_features
-from .rotations import so3_exp, yaw_mat
+from .motion import CONTROL_DT
+from .rotations import so3_exp
 
 
 def mlp(inp: int, hidden: list[int], out: int, act=nn.ELU, layer_norm: bool = False) -> nn.Sequential:
@@ -65,7 +66,7 @@ def run_mlp(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 class WorldModel(nn.Module):
-    """Deterministic dynamics s_{t+1} = f(s_t, a_t, xi) predicting frame-local state increments."""
+    """Dynamics with body-frame pose residuals over explicit integration and velocity/joint increments."""
 
     def __init__(self, hidden=(2048, 2048, 2048)):
         super().__init__()
@@ -81,17 +82,16 @@ class WorldModel(nn.Module):
 
     @staticmethod
     def targets(S, S1):
-        """Frame-local increments from S to S1 (the regression targets)."""
+        """Targets: (r_p, r_theta, dv_body, dw_body, dq, dqd), in the current body's frame."""
         from .rotations import so3_log
 
         p, R, v, w, q, qd = S
         p1, R1, v1, w1, q1, qd1 = S1
-        H = yaw_mat(R)
         Rt = R.transpose(-1, -2)
         return torch.cat(
             (
-                (H.transpose(-1, -2) @ (p1 - p).unsqueeze(-1)).squeeze(-1),
-                so3_log(Rt @ R1),
+                (Rt @ (p1 - p - CONTROL_DT * v).unsqueeze(-1)).squeeze(-1),
+                so3_log(Rt @ R1) - CONTROL_DT * (Rt @ w.unsqueeze(-1)).squeeze(-1),
                 (Rt @ (v1 - v).unsqueeze(-1)).squeeze(-1),
                 (Rt @ (w1 - w).unsqueeze(-1)).squeeze(-1),
                 q1 - q,
@@ -104,26 +104,25 @@ class WorldModel(nn.Module):
         p, R, v, w, q, qd = S
         y = run_mlp(self.net, self.in_norm(self.inputs(S, a, xi_n)))
         d = y * self.out_norm.std() + self.out_norm.mean
-        H = yaw_mat(R)
-        dp, dth, dv, dw, dq, dqd = d.split((3, 3, 3, 3, NUM_J, NUM_J), -1)
-        p1 = p + (H @ dp.unsqueeze(-1)).squeeze(-1)
-        R1 = R @ so3_exp(dth)
+        rp, rth, dv, dw, dq, dqd = d.split((3, 3, 3, 3, NUM_J, NUM_J), -1)
+        w_body = (R.transpose(-1, -2) @ w.unsqueeze(-1)).squeeze(-1)
+        p1 = p + CONTROL_DT * v + (R @ rp.unsqueeze(-1)).squeeze(-1)
+        R1 = R @ so3_exp(CONTROL_DT * w_body + rth)
         v1 = v + (R @ dv.unsqueeze(-1)).squeeze(-1)
         w1 = w + (R @ dw.unsqueeze(-1)).squeeze(-1)
         return (p1, R1, v1, w1, q + dq, qd + dqd)
 
     @staticmethod
     def state_error(S_hat, S):
-        """Frame-local state error components (same layout as ``targets``)."""
+        """State errors in the true state's body frame; no explicit-integration terms are subtracted."""
         from .rotations import so3_log
 
         p, R, v, w, q, qd = S
         ph, Rh, vh, wh, qh, qdh = S_hat
-        H = yaw_mat(R)
         Rt = R.transpose(-1, -2)
         return torch.cat(
             (
-                (H.transpose(-1, -2) @ (ph - p).unsqueeze(-1)).squeeze(-1),
+                (Rt @ (ph - p).unsqueeze(-1)).squeeze(-1),
                 so3_log(Rt @ Rh),
                 (Rt @ (vh - v).unsqueeze(-1)).squeeze(-1),
                 (Rt @ (wh - w).unsqueeze(-1)).squeeze(-1),

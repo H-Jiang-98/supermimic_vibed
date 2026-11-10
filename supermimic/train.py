@@ -74,7 +74,7 @@ if args.resume:
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
 
 
-# per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
+# State-error scale floors; out_norm tracks pose residuals and velocity/joint increments.
 ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
                        torch.full((29,), 3e-3), torch.full((29,), 5e-2))).to(dev)  # fmt: skip
 
