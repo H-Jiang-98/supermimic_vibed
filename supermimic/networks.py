@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
-from .mdp import INV_DIM, NUM_J, XI_DIM, invariant_features
-from .motion import CONTROL_DT
+from .mdp import INV_DIM, NUM_J, XI_DIM
 from .rotations import so3_exp
 
 
@@ -52,9 +53,43 @@ class RunningNorm(nn.Module):
         return torch.sqrt(self.var + self.eps**2)
 
 
-WM_OUT = 3 + 3 + 3 + 3 + NUM_J + NUM_J
+class WorldModelNorm(nn.Module):
+    """Explicit empirical normalization: (x - mean) / (std + eps).
 
-# bf16 autocast for MLP matmuls only (state integration, FK, rewards stay fp32)
+    Only freshly collected data updates these statistics. Buffers retain their
+    storage for compiled consumers; unlike the policy normalizer, there is no
+    sample-count limit. This matches the official dynamics normalizer's math.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-2):
+        super().__init__()
+        self.eps = eps
+        self.register_buffer("mean", torch.zeros(dim))
+        self.register_buffer("var", torch.ones(dim))
+        self.register_buffer("std", torch.ones(dim))
+        self.register_buffer("count", torch.zeros((), dtype=torch.long))
+
+    @torch.no_grad()
+    def update(self, x):
+        x = x.reshape(-1, x.shape[-1]).to(self.mean.dtype)
+        n = x.shape[0]
+        if n == 0:
+            return
+        mean, var = x.mean(0), x.var(0, unbiased=False)
+        total = self.count + n
+        delta = mean - self.mean
+        self.var.copy_((self.var * self.count + var * n + delta.square() * self.count * n / total) / total)
+        self.mean.add_(delta * n / total)
+        self.std.copy_(self.var.sqrt())
+        self.count.add_(n)
+
+    def forward(self, x):
+        return (x - self.mean) / (self.std + self.eps)
+
+
+WM_OUT = 6 + NUM_J
+
+# Optional bf16 for policy/critic MLPs. World-model dynamics stay fp32/TF32.
 AMP_DTYPE: torch.dtype | None = None
 
 
@@ -66,71 +101,69 @@ def run_mlp(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 class WorldModel(nn.Module):
-    """Dynamics with body-frame pose residuals over explicit integration and velocity/joint increments."""
+    """Official gencoord dynamics, adapted to the existing matrix/world-velocity state.
 
-    def __init__(self, hidden=(2048, 2048, 2048)):
+    Predict [delta_v_body, delta_w_body, delta_joint_velocity], then integrate
+    poses analytically with the simulator's substep coefficient. Actions are raw
+    policy outputs and xi is the RAW 33-channel simulator context at every call.
+    """
+
+    def __init__(self, hidden=(2048, 2048, 2048), *, action_scale, action_offset, dt, num_substeps):
         super().__init__()
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError("World-model dt must be finite and positive")
+        if type(num_substeps) is not int or num_substeps < 1:
+            raise ValueError("World-model num_substeps must be a positive integer")
+        if action_scale.shape != (NUM_J,) or action_offset.shape != (NUM_J,):
+            raise ValueError(f"World-model action scale/offset must have shape ({NUM_J},)")
+        self.dt = float(dt)
+        self.num_substeps = num_substeps
+        self.substep_coeff = (num_substeps + 1) / (2 * num_substeps)
+        self.register_buffer("action_scale", action_scale.detach().float().clone())
+        self.register_buffer("action_offset", action_offset.detach().float().clone())
+        self.register_buffer("context_mean", torch.tensor([0.75] + [0.] * 32))
+        self.register_buffer("context_scale", torch.tensor([0.45] + [0.01] * 29 + [0.025, 0.05, 0.05]))
         self.in_dim = INV_DIM + NUM_J + XI_DIM
-        self.net = mlp(self.in_dim, list(hidden), WM_OUT, act=nn.SiLU, layer_norm=True)
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-        self.in_norm = RunningNorm(self.in_dim)
-        self.out_norm = RunningNorm(WM_OUT, eps=1e-4)
-
-    def inputs(self, S, a, xi_n):
-        return torch.cat((invariant_features(S), a, xi_n), -1)
+        self.net = mlp(self.in_dim, list(hidden), WM_OUT, act=nn.GELU, layer_norm=True)
+        self.state_normalizer = WorldModelNorm(INV_DIM)
+        self.action_normalizer = WorldModelNorm(NUM_J)
 
     @staticmethod
-    def targets(S, S1):
-        """Targets: (r_p, r_theta, dv_body, dw_body, dq, dqd), in the current body's frame."""
-        from .rotations import so3_log
-
+    def state_features(S):
+        """68 XY/yaw-invariant channels; gravity is a unit direction."""
         p, R, v, w, q, qd = S
-        p1, R1, v1, w1, q1, qd1 = S1
         Rt = R.transpose(-1, -2)
-        return torch.cat(
-            (
-                (Rt @ (p1 - p - CONTROL_DT * v).unsqueeze(-1)).squeeze(-1),
-                so3_log(Rt @ R1) - CONTROL_DT * (Rt @ w.unsqueeze(-1)).squeeze(-1),
-                (Rt @ (v1 - v).unsqueeze(-1)).squeeze(-1),
-                (Rt @ (w1 - w).unsqueeze(-1)).squeeze(-1),
-                q1 - q,
-                qd1 - qd,
-            ),
-            -1,
-        )
+        return torch.cat((p[..., 2:3], -R[..., 2, :], (Rt @ v[..., None])[..., 0],
+                          (Rt @ w[..., None])[..., 0], q, qd), -1)
 
-    def step(self, S, a, xi_n):
+    def proc(self, a):
+        return a * self.action_scale + self.action_offset
+
+    @torch.no_grad()
+    def update_normalization(self, S, a):
+        self.state_normalizer.update(self.state_features(S))
+        self.action_normalizer.update(self.proc(a))
+
+    def inputs(self, S, a, xi):
+        return torch.cat((self.state_normalizer(self.state_features(S)),
+                          self.action_normalizer(self.proc(a)),
+                          (xi - self.context_mean) / self.context_scale), -1)
+
+    def apply_prediction(self, S, prediction):
+        """Velocity deltas use the current body frame; state velocities use world axes."""
         p, R, v, w, q, qd = S
-        y = run_mlp(self.net, self.in_norm(self.inputs(S, a, xi_n)))
-        d = y * self.out_norm.std() + self.out_norm.mean
-        rp, rth, dv, dw, dq, dqd = d.split((3, 3, 3, 3, NUM_J, NUM_J), -1)
-        w_body = (R.transpose(-1, -2) @ w.unsqueeze(-1)).squeeze(-1)
-        p1 = p + CONTROL_DT * v + (R @ rp.unsqueeze(-1)).squeeze(-1)
-        R1 = R @ so3_exp(CONTROL_DT * w_body + rth)
-        v1 = v + (R @ dv.unsqueeze(-1)).squeeze(-1)
-        w1 = w + (R @ dw.unsqueeze(-1)).squeeze(-1)
-        return (p1, R1, v1, w1, q + dq, qd + dqd)
+        dv_b, dw_b, dqd = prediction.split((3, 3, NUM_J), -1)
+        dv = (R @ dv_b[..., None])[..., 0]
+        dw = (R @ dw_b[..., None])[..., 0]
+        w_b = (R.transpose(-1, -2) @ w[..., None])[..., 0]
+        c, dt = self.substep_coeff, self.dt
+        p1 = p + dt * (v + c * dv)
+        R1 = R @ so3_exp(dt * (w_b + c * dw_b))
+        return p1, R1, v + dv, w + dw, q + dt * (qd + c * dqd), qd + dqd
 
-    @staticmethod
-    def state_error(S_hat, S):
-        """State errors in the true state's body frame; no explicit-integration terms are subtracted."""
-        from .rotations import so3_log
-
-        p, R, v, w, q, qd = S
-        ph, Rh, vh, wh, qh, qdh = S_hat
-        Rt = R.transpose(-1, -2)
-        return torch.cat(
-            (
-                (Rt @ (ph - p).unsqueeze(-1)).squeeze(-1),
-                so3_log(Rt @ Rh),
-                (Rt @ (vh - v).unsqueeze(-1)).squeeze(-1),
-                (Rt @ (wh - w).unsqueeze(-1)).squeeze(-1),
-                qh - q,
-                qdh - qd,
-            ),
-            -1,
-        )
+    def step(self, S, a, xi):
+        # Deliberately bypass run_mlp: AMP_DTYPE only controls policy/critic.
+        return self.apply_prediction(S, self.net(self.inputs(S, a, xi)))
 
 
 class Policy(nn.Module):

@@ -17,6 +17,11 @@ TRAIN_DEFAULTS = {
     "wm_window": 8,
     "wm_batches": 10,
     "wm_batch": 2048,
+    "wm_lr": 2e-4,
+    "wm_nominal_error_root_pos": 0.01,
+    "wm_nominal_error_root_ori": 0.02,
+    "wm_nominal_error_joint_pos": 0.1,
+    "wm_nominal_error_joint_vel": 3.14,
     "pi_batch": 4096,
     "lr": 2e-4,
     "gamma": 0.99,
@@ -53,7 +58,8 @@ def validate_training(overrides):
             minimum = 0 if key in ("seed", "warmup_steps", "wm_only_iters") else 1
             if value < minimum:
                 raise ValueError(f"training.{key} must be >= {minimum}")
-    for key in ("utd", "lr"):
+    for key in ("utd", "lr", "wm_lr", "wm_nominal_error_root_pos", "wm_nominal_error_root_ori",
+                "wm_nominal_error_joint_pos", "wm_nominal_error_joint_vel"):
         if values[key] <= 0:
             raise ValueError(f"training.{key} must be positive")
     if not 0 <= values["gamma"] < 1:
@@ -66,8 +72,10 @@ def validate_training(overrides):
         raise ValueError(f"training.obs_mode must be one of {tuple(OBS_DIMS)}")
     if values["amp"] not in ("none", "bf16"):
         raise ValueError("training.amp must be 'none' or 'bf16'")
-    if values["buffer_steps"] < values["wm_window"]:
-        raise ValueError("training.buffer_steps must be >= wm_window")
+    if values["wm_window"] < 2:
+        raise ValueError("training.wm_window must contain at least 2 state frames")
+    if values["buffer_steps"] < values["wm_window"] - 1:
+        raise ValueError("training.buffer_steps must be >= wm_window - 1")
     if not values["no_critic"] and values["critic_minibatches"] > values["horizon"] * values["pi_batch"]:
         raise ValueError("training.critic_minibatches must be <= horizon * pi_batch")
     return values
@@ -86,5 +94,8 @@ def add_training_args(parser: argparse.ArgumentParser, overrides=None):
                 options["choices"] = tuple(OBS_DIMS)
             if key == "amp":
                 options["choices"] = ("none", "bf16")
+                options["help"] = "Policy/critic MLP precision; world model always uses FP32/TF32"
+            if key == "wm_window":
+                options["help"] = "World-model state frames per window (8 frames = 7 predictions)"
             parser.add_argument(f"--{key}", **options)
     parser.set_defaults(**defaults)

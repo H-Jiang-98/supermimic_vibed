@@ -111,11 +111,13 @@ class ObservationTest(unittest.TestCase):
         for mode, dim in OBS_DIMS.items():
             mdp = self.mdp(mode)
             pi = Policy(dim, 73, hist=2)
-            wm = WorldModel(hidden=(16,))
+            wm = WorldModel(hidden=(16,), action_scale=torch.ones(29), action_offset=torch.zeros(29),
+                            dt=0.02, num_substeps=4)
             S = tuple(x.float() for x in self.state((2,)))
             mdp.default_q = mdp.default_q.float()
             mdp.motion = SimpleNamespace(**{k: v.float() for k, v in vars(self.motion).items()})
             xi, a, f, goal = torch.zeros(2, 33), torch.zeros(2, 29), torch.zeros(2, dtype=torch.long), torch.randn(2, 73)
+            xi[:, 0] = .75  # WorldModel.step receives raw simulator context.
             hist = mdp.obs(S, a, xi, f).unsqueeze(1).repeat(1, 2, 1)
             for _ in range(2):
                 a = pi(hist, goal)

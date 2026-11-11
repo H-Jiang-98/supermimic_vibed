@@ -3,33 +3,35 @@ import os, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import torch
 from supermimic.kinematics import G1Kinematics
-from supermimic.motion import MotionLib
+from supermimic.motion import MotionLib, CONTROL_DT
 from supermimic.config import load_config
-from supermimic.mdp import MDP, flatten_state, unflatten_state, normalize_xi
+from supermimic.mdp import MDP, normalize_xi
 from supermimic.networks import WorldModel
-from supermimic.robot import default_joint_pos_list
+from supermimic.robot import G1_JOINT_NAMES, action_scale, default_joint_pos_list
 torch.backends.cuda.matmul.allow_tf32 = True
 dev = "cuda:0"
 kin = G1Kinematics(dev)
 motion = MotionLib.from_dir(load_config()["motion_dir"], kin, dev)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev),
           obs_mode=load_config()["training"]["obs_mode"])
-wm = WorldModel().to(dev)
+wm = WorldModel(action_scale=torch.tensor([action_scale(n) for n in G1_JOINT_NAMES]),
+                action_offset=mdp.default_q, dt=CONTROL_DT, num_substeps=4).to(dev)
 B = 2048
 f = torch.randint(0, motion.num_frames - 20, (B * 8,), device=dev)
-S = motion.ref_state(f); S1 = motion.ref_state(f + 1)
+S = motion.ref_state(f)
 a = torch.randn(B * 8, 29, device=dev); xi = torch.zeros(B * 8, 33, device=dev); xi[:, 0] = 0.75
-wm.in_norm.update(wm.inputs(S, a, normalize_xi(xi))); wm.out_norm.update(wm.targets(S, S1))
-std = wm.out_norm.std()
-names = ["r_p"] * 3 + ["r_theta"] * 3 + ["dv"] * 3 + ["dw"] * 3 + ["dq"] * 29 + ["dqd"] * 29
-print("out std per group:", {n: f"{std[[i for i, m in enumerate(names) if m == n]].min().item():.2e}..{std[[i for i, m in enumerate(names) if m == n]].max().item():.2e}" for n in dict.fromkeys(names)})
+wm.update_normalization(S, a)
+print("gencoord: 35 velocity deltas, substep coefficient", wm.substep_coeff)
+print("input std ranges:", {name: (norm.std.min().item(), norm.std.max().item())
+                            for name, norm in (("state", wm.state_normalizer), ("action", wm.action_normalizer))})
 def timeit(fn, n=5):
     fn(); torch.cuda.synchronize(); t = time.time()
     for _ in range(n): fn()
     torch.cuda.synchronize(); return (time.time() - t) / n
 Sb = tuple(x[:B] for x in S)
 def wm_step_fb():
-    out = wm.step(Sb, a[:B], normalize_xi(xi[:B]))
+    wm.zero_grad(set_to_none=True)
+    out = wm.step(Sb, a[:B], xi[:B])
     sum(o.sum() for o in out).backward()
 print("wm step fwd+bwd (B=2048): %.1f ms" % (1000 * timeit(wm_step_fb)))
 Sb4 = tuple(x[:4096].clone().requires_grad_(True) for x in motion.ref_state(f[:4096]))

@@ -115,6 +115,56 @@ independent of the configured `ckpt_every` interval.
 When using wrappers, a misplaced `--config` after the script/run name is rejected to prevent
 selecting one environment while loading another configuration's assets.
 
+## World-model training
+
+The default world model follows the official generalized-coordinate implementation:
+35 velocity increments, substep-aware pose integration, and a fixed-scale state loss.
+See [the equations and input/output conventions](reference.md#world-model).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `wm_window` | 8 | Number of state frames; 7 predictions at the default |
+| `wm_batches` | 10 | World-model updates per iteration |
+| `wm_batch` | 2048 | Windows per update |
+| `wm_lr` | 0.0002 | Fixed learning rate for both Muon and Adam |
+| `wm_nominal_error_root_pos` | 0.01 | Root-position error scale (m) |
+| `wm_nominal_error_root_ori` | 0.02 | Root-rotation error scale (rad) |
+| `wm_nominal_error_joint_pos` | 0.1 | Joint-position error scale (rad) |
+| `wm_nominal_error_joint_vel` | 3.14 | Joint-velocity error scale (rad/s) |
+
+`wm_window` must be at least 2, and the replay buffer must hold at least `wm_window−1`
+transitions. All learning rates and nominal errors must be finite and positive. The WM
+loss averages across valid transitions, including terminal transitions and excluding the
+rest of a sampled window after a reset. Its scale differs from the previous residual loss.
+
+`lr` and `lr_decay_iters` now control only policy/critic training. `amp` also applies only
+to policy/critic MLPs; the world model uses FP32 with TF32 enabled. Muon requires
+`torch.optim.Muon` (available in the configured PyTorch 2.11 environment).
+
+New checkpoints use world-model format version 2 and record the integration timestep,
+substep count, input-normalization statistics and both optimizer states. Training resume
+requires a matching version and integration configuration, plus `last.pt` rather than a
+numbered evaluation checkpoint. Old residual-model checkpoints cannot resume this model;
+start a fresh run. There is no automatic weight conversion or checkpoint deletion.
+Policy-only evaluation still reads its existing observation and architecture metadata.
+As before, resume with the original training flags, including the nominal-error settings.
+
+CPU contracts and optional CUDA compilation/update checks:
+
+```bash
+source tools/activate.sh
+python -m unittest tools.test_world_model tools.test_observation -v
+```
+
+The world-model test skips its CUDA check when no GPU is available. For an end-to-end GPU
+smoke run (small replay batches, one WM-only iteration, then policy/critic updates):
+
+```bash
+./run_train.sh wm_gencoord_smoke --num_envs 32 --buffer_steps 64 \
+  --wm_batch 16 --wm_batches 1 --pi_batch 16 --horizon 4 \
+  --wm_only_iters 1 --iterations 3 --log_every 1 --ckpt_every 3 --visualizer none
+```
+
 ## Data and asset conversion
 
 Existing data needs no download or conversion. To download all motions and robot assets,

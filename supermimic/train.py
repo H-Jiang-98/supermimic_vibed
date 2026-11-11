@@ -36,24 +36,30 @@ args.runtime_config = dict(runtime_config, training=effective_training, motion_d
 import torch
 import torch.nn as nn
 
-from supermimic.checkpoints import checkpoint_obs_mode
+from supermimic.checkpoints import WM_FORMAT_VERSION, checkpoint_obs_mode, checkpoint_world_model
 from supermimic.buffer import ReplayBuffer
 from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MDP, invariant_features, normalize_xi, unflatten_state
+from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MDP, normalize_xi, unflatten_state
 from supermimic.motion import MotionLib
 import supermimic.networks as networks
 from supermimic.networks import Critic, Policy, WorldModel
-from supermimic.robot import default_joint_pos_list
+from supermimic.robot import G1_JOINT_NAMES, action_scale, default_joint_pos_list
+from supermimic.wm_training import (WM_LOSS_GROUPS, WorldModelLoss, build_wm_optimizers,
+                                   load_wm_optimizer_state, optimize_world_model, rollout_world_model,
+                                   sample_wm_windows)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.manual_seed(args.seed)
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
 dev = "cuda:0"
+sim_cfg = make_sim(dev, args)
+wm_config = {"dt": sim_cfg.dt, "num_substeps": sim_cfg.physics.num_substeps}
 resume_ck = None
 if args.resume:
     resume_ck = torch.load(args.resume, map_location="cpu")
+    checkpoint_world_model(resume_ck, **wm_config)
     checkpoint_obs_mode(resume_ck, args.obs_mode)
 os.makedirs(args.log_dir, exist_ok=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
@@ -65,45 +71,35 @@ K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = 73 * K
 CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
 
-wm = WorldModel().to(dev)
+wm = WorldModel(action_scale=torch.tensor([action_scale(n) for n in G1_JOINT_NAMES]),
+                action_offset=mdp.default_q, **wm_config).to(dev)
+wm_loss = WorldModelLoss(*(getattr(args, f"wm_nominal_error_{name}") for name in WM_LOSS_GROUPS)).to(dev)
 pi = Policy(mdp.obs_dim, GOAL_DIM, hist=Hh).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
-opt_wm = torch.optim.Adam(wm.parameters(), lr=args.lr)
+opt_wm = build_wm_optimizers(wm, args.wm_lr)
 opt_pi = torch.optim.Adam(pi.parameters(), lr=args.lr, betas=(0.9, 0.95))
 opt_v = torch.optim.Adam(critic.parameters(), lr=args.lr)
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 if args.resume:
     ck = resume_ck
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
-    opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
+    load_wm_optimizer_state(opt_wm, ck["opt_wm"])
+    opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
     del ck, resume_ck
 
 
-# State-error scale floors; out_norm tracks pose residuals and velocity/joint increments.
-ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
-                       torch.full((29,), 3e-3), torch.full((29,), 5e-2))).to(dev)  # fmt: skip
-
-
 def _wm_rollout(s, a, xi):
-    S = unflatten_state(s[:, 0])
-    preds = []
-    for j in range(args.wm_window):
-        S = wm.step(S, a[:, j], normalize_xi(xi[:, j]))
-        preds.append(S)
-    return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
+    return rollout_world_model(wm, s, a, xi)
 
 
 def _wm_err(S_hat, s1, mask):
-    std = torch.maximum(wm.out_norm.std(), ERR_FLOOR)
-    e = (wm.state_error(S_hat, unflatten_state(s1)) / std) ** 2  # (B, k, D)
-    e = e.mean(-1)
-    return (e * mask).sum() / s1.shape[0], e[:, -1]
+    return wm_loss(S_hat, unflatten_state(s1), mask)
 
 
-def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
+def _imag_step(S, o_hist, f, xi, g):
     a = pi(o_hist, g)
-    S1 = wm.step(S, a, xi_n)
+    S1 = wm.step(S, a, xi)
     f1 = f + 1
     o1 = mdp.add_noise(mdp.obs(S1, a, xi, f1))
     o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
@@ -138,15 +134,11 @@ def set_requires_grad(m: nn.Module, flag: bool):
 
 # ------------------------------------------------------------------------------------------------
 def wm_update():
-    w = buffer.sample_windows(args.wm_batch, args.wm_window)
+    w = sample_wm_windows(buffer, args.wm_batch, args.wm_window)
     S_hat = wm_rollout(w["s"], w["a"], w["xi"])
-    loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
-    opt_wm.zero_grad(set_to_none=True)
-    loss.backward()
-    nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
-    opt_wm.step()
-    m = w["mask"][:, -1]
-    return loss.detach() / args.wm_window, (e_last.detach() * m).sum() / m.sum().clamp(min=1)
+    loss, e_last, group_mse = wm_err(S_hat, w["s1"], w["mask"])
+    optimize_world_model(wm, opt_wm, loss)
+    return loss.detach(), e_last.detach(), group_mse.detach()
 
 
 def sample_valid_starts(B: int):
@@ -184,7 +176,7 @@ def policy_update():
     Ss, As, Aps, Fs, Gs = [], [], [], [], []
     for t in range(HZ):
         Aps.append(a_prev)
-        S, a_prev, o_hist, f, g = imag_step(S, o_hist, a_prev, f, xi, xi_n, g)
+        S, a_prev, o_hist, f, g = imag_step(S, o_hist, f, xi, g)
         Ss.append(S), As.append(a_prev), Fs.append(f), Gs.append(g)
     flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
     S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
@@ -250,7 +242,6 @@ def policy_update():
 
 
 # ------------------------------------------------------------------------------------------------
-sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
     env = TrackingSim(sim_cfg, args.num_envs, motion, mdp, gamma=args.gamma)
     buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
@@ -271,9 +262,7 @@ with launch_simulation(sim_cfg, args):
             a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
             out = env.step(a)
             buffer.add(out)
-            S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-            wm.in_norm.update(wm.inputs(S0, out["a"], normalize_xi(out["xi"])))
-            wm.out_norm.update(wm.targets(S0, S1))
+            wm.update_normalization(unflatten_state(out["s"]), out["a"])
             sim_steps += args.num_envs
             stats["r"].append(out["r"].mean() / 0.1)
             if "ep_len" in out:
@@ -283,18 +272,19 @@ with launch_simulation(sim_cfg, args):
                 stats["done"].append(out["done"].float().sum())
 
     stats = {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
-    if buffer.size < args.wm_window:
-        collect(max(args.warmup_steps, args.wm_window), stats)
+    if buffer.size < args.wm_window - 1:
+        collect(max(args.warmup_steps, args.wm_window - 1), stats)
     log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
     if start_it == 0:
-        log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr\n")
+        log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err_last,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr,wm_lr,"
+                    + ",".join(f"wm_{name}_mse" for name in WM_LOSS_GROUPS) + "\n")
     t_start = time.time() - wall_offset
     t_log = time.time()
     step_acc = 0.0
-    agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": []}
+    agg = {key: [] for key in ("wm", "wm_last", "pi", "v", "ir", "gn", "surv", *WM_LOSS_GROUPS)}
     for it in range(start_it, args.iterations):
         lr = lr_at(it)
-        for o in (opt_wm, opt_pi, opt_v):
+        for o in (opt_pi, opt_v):
             for gparam in o.param_groups:
                 gparam["lr"] = lr
         step_acc += 1.0 / args.utd
@@ -307,10 +297,12 @@ with launch_simulation(sim_cfg, args):
         if prof:
             torch.cuda.synchronize(); tp1 = time.time()
         for _ in range(args.wm_batches):
-            l, e8 = wm_update()
+            l, e_last, group_mse = wm_update()
+            agg["wm"].append(l), agg["wm_last"].append(e_last)
+            for name, mse in zip(WM_LOSS_GROUPS, group_mse):
+                agg[name].append(mse)
         if prof:
             torch.cuda.synchronize(); tp2 = time.time()
-        agg["wm"].append(l), agg["wm8"].append(e8)
         if it >= args.wm_only_iters:
             pl, vl, ir, gn, surv = policy_update()
             if prof:
@@ -323,23 +315,25 @@ with launch_simulation(sim_cfg, args):
             t_log = time.time()
             wall_h = (time.time() - t_start) / 3600
             term_frac = float(sum(float(v) for v in stats["term"]) / max(sum(float(v) for v in stats["done"]), 1))
-            row = [it + 1, wall_h, sim_steps, mean(agg["wm"]), mean(agg["wm8"]), mean(agg["pi"]), mean(agg["v"]), mean(agg["ir"]),
-                   mean(agg["gn"]), mean(agg["surv"]), mean(stats["r"]), mean(stats["ep_len"]), mean(stats["ep_ret"]), term_frac, ips, lr]  # fmt: skip
+            row = [it + 1, wall_h, sim_steps, mean(agg["wm"]), mean(agg["wm_last"]), mean(agg["pi"]), mean(agg["v"]), mean(agg["ir"]),
+                   mean(agg["gn"]), mean(agg["surv"]), mean(stats["r"]), mean(stats["ep_len"]), mean(stats["ep_ret"]), term_frac, ips, lr,
+                   opt_wm["muon"].param_groups[0]["lr"], *(mean(agg[name]) for name in WM_LOSS_GROUPS)]  # fmt: skip
             log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
             log_f.flush()
-            print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
+            print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} last {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
                   f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
             stats = {k: [] for k in stats}
             agg = {k: [] for k in agg}
         if (it + 1) % args.ckpt_every == 0 or it + 1 == args.iterations:
-            ck = {"wm": wm.state_dict(), "pi": pi.state_dict(), "critic": critic.state_dict(), "opt_wm": opt_wm.state_dict(),
+            ck = {"wm": wm.state_dict(), "wm_format_version": WM_FORMAT_VERSION, "wm_config": wm_config,
+                  "pi": pi.state_dict(), "critic": critic.state_dict(), "opt_wm": {k: o.state_dict() for k, o in opt_wm.items()},
                   "opt_pi": opt_pi.state_dict(), "opt_v": opt_v.state_dict(), "iteration": it + 1,
                   "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
                   "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
             last = os.path.join(args.log_dir, "last.pt")
             torch.save(ck, last + ".tmp")
             os.replace(last + ".tmp", last)
-            small = {k: ck[k] for k in ("pi", "wm", "iteration", "wall_time", "sim_steps", "args", "saved_at")}
+            small = {k: ck[k] for k in ("pi", "wm", "wm_format_version", "wm_config", "iteration", "wall_time", "sim_steps", "args", "saved_at")}
             path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
             torch.save(small, path + ".tmp")
             os.replace(path + ".tmp", path)
